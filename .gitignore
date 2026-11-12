@@ -1,0 +1,29 @@
+# Python
+__pycache__/
+*.py[cod]
+.venv/
+venv/
+.env
+.env.*
+
+# Build PyInstaller
+build/
+dist/
+*.spec
+minia.ico
+
+# Binaires FFmpeg éventuellement copiés à côté de l'app
+ffmpeg.exe
+ffprobe.exe
+
+# Médias de test et fichiers temporaires
+*.mp4
+*.m4v
+*.mov
+*.tmp
+
+# Éditeurs / OS
+.vscode/
+.idea/
+Thumbs.db
+desktop.ini
