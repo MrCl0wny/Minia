@@ -139,45 +139,51 @@ class _MoovOnlyMP4(MP4):
 
 
 _ZERO_ATOM = b"\0\0\0\0"
+_MAX_TAIL = 1024 * 1024  # données parasites tolérées après le dernier atome
 
 
-def _top_level_atoms(path: Path) -> tuple[list[tuple[bytes, int, int]], int] | None:
-    """Atomes de premier niveau (type, position, taille) et position de fin utile,
-    ou None si la structure ne permet pas la méthode rapide (MP4 fragmenté,
-    données parasites en fin de fichier, plusieurs `moov`…).
+def _top_level_atoms(path: Path) -> tuple[list[tuple[bytes, int, int]], int, int] | None:
+    """Analyse les atomes de premier niveau pour la méthode rapide.
+
+    Renvoie (atomes, fin, début_queue) : les atomes (type, position, taille), la
+    position où écrire le nouvel index, et le début d'une éventuelle « queue » de
+    données parasites (certains sites ajoutent quelques octets après le dernier
+    atome) à conserver telle quelle derrière le nouvel index. Renvoie None si la
+    structure ne s'y prête pas (MP4 fragmenté, fichier tronqué, plusieurs `moov`…).
 
     Les restes d'une écriture interrompue (voir `_write_cover_append`) en fin de
     fichier sont ignorés et seront écrasés."""
     size = path.stat().st_size
     atoms = []
+    tail = size
     with open(path, "rb") as f:
         pos = 0
         while pos < size:
             f.seek(pos)
             head = f.read(16)
-            if len(head) < 8:
-                return None
-            length = int.from_bytes(head[:4], "big")
+            length = int.from_bytes(head[:4], "big") if len(head) >= 8 else 0
             kind = head[4:8]
-            if length == 0 and kind == _ZERO_ATOM:
-                break
+            if len(head) >= 8 and length == 0 and kind == _ZERO_ATOM:
+                break  # reste d'écriture interrompue : écrasé, avec ce qui le suit
             if length == 1:
-                if len(head) < 16:
+                length = int.from_bytes(head[8:16], "big") if len(head) >= 16 else 0
+            if len(head) < 8 or length < 8 or pos + length > size:
+                if size - pos > _MAX_TAIL:  # pas une simple queue : fichier tronqué ou abîmé
                     return None
-                length = int.from_bytes(head[8:16], "big")
-            if length < 8 or pos + length > size:  # 0 = « jusqu'à la fin », ou fichier tronqué
-                return None
+                tail = pos
+                break
             atoms.append((kind, pos, length))
             pos += length
+    end = pos
     # Un second `moov` en dernière position est un nouvel index dont l'écriture a été
     # interrompue avant le renommage de l'ancien : les lecteurs prennent le premier,
     # celui-ci est donc ignoré et sera écrasé.
     while len(atoms) > 1 and atoms[-1][0] == b"moov" and [a[0] for a in atoms].count(b"moov") > 1:
-        pos = atoms.pop()[1]
+        end = atoms.pop()[1]
     kinds = [a[0] for a in atoms]
     if kinds.count(b"moov") != 1 or b"moof" in kinds:
         return None
-    return atoms, pos
+    return atoms, end, tail
 
 
 def _open_for_update(path: Path):
@@ -195,20 +201,23 @@ def _open_for_update(path: Path):
 
 
 def _write_cover_append(src: Path, atoms: list[tuple[bytes, int, int]], end: int,
-                        jpeg: bytes) -> None:
+                        tail_start: int, jpeg: bytes) -> None:
     """Ajoute un nouveau `moov` (avec la cover) en fin de fichier, puis renomme
     l'ancien en `free` (4 octets). L'ancien index reste dans le fichier comme
-    espace libre (quelques centaines de Ko à quelques Mo).
+    espace libre (quelques centaines de Ko à quelques Mo). Une éventuelle queue
+    de données parasites est recopiée telle quelle derrière le nouvel index.
 
     Ordre choisi pour qu'une coupure à n'importe quel moment laisse un fichier lisible :
-    1. corps du nouvel index écrit après un en-tête laissé à zéro : tant que l'en-tête
-       est nul, c'est un atome inconnu « jusqu'à la fin » que les lecteurs ignorent ;
+    1. corps du nouvel index (et queue) écrits après un en-tête laissé à zéro : tant que
+       l'en-tête est nul, c'est un atome inconnu « jusqu'à la fin » que les lecteurs ignorent ;
     2. en-tête `moov` écrit : deux `moov`, les lecteurs prennent le premier (l'ancien) ;
     3. ancien `moov` renommé en `free` : seul le nouveau reste."""
     _, moov_pos, moov_len = next(a for a in atoms if a[0] == b"moov")
     duration = probe_duration(src)
 
     with open(src, "rb") as f:
+        f.seek(tail_start)
+        tail = f.read()
         f.seek(moov_pos)
         buf = io.BytesIO(f.read(moov_len))
     try:
@@ -231,12 +240,20 @@ def _write_cover_append(src: Path, atoms: list[tuple[bytes, int, int]], end: int
         f.flush()
         os.fsync(f.fileno())
 
+    def restore(f):  # remet le fichier dans son état d'origine
+        f.seek(moov_pos + 4)
+        f.write(b"moov")
+        f.truncate(end)
+        f.seek(end)
+        f.write(tail)
+
     with _open_for_update(src) as f:
         try:
-            f.truncate(end)  # retire un éventuel reste d'écriture interrompue
             f.seek(end)
             f.write(bytes(8))
             f.write(new_moov[8:])
+            f.write(tail)
+            f.truncate()  # retire un éventuel reste d'écriture interrompue
             sync(f)
             f.seek(end)
             f.write(new_moov[:8])
@@ -245,9 +262,7 @@ def _write_cover_append(src: Path, atoms: list[tuple[bytes, int, int]], end: int
             f.write(b"free")
             sync(f)
         except BaseException:
-            f.seek(moov_pos + 4)  # remet le fichier exactement dans son état d'origine
-            f.write(b"moov")
-            f.truncate(end)
+            restore(f)
             raise
 
     # Vérification : la cover est bien là et la vidéo est toujours lisible.
@@ -260,9 +275,7 @@ def _write_cover_append(src: Path, atoms: list[tuple[bytes, int, int]], end: int
         ok = False
     if not ok:
         with _open_for_update(src) as f:
-            f.seek(moov_pos + 4)
-            f.write(b"moov")
-            f.truncate(end)
+            restore(f)
         raise MiniaError("Vérification échouée : la vidéo a été remise dans son état d'origine.")
 
 
