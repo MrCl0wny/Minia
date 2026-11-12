@@ -20,8 +20,8 @@ from PySide6.QtWidgets import (QAbstractButton, QApplication, QButtonGroup, QFil
 
 import core
 
-FRAME_COUNT = 12
-COLUMNS = 4
+FRAME_COUNT = 30
+COLUMNS = 6
 
 # Palette
 BG = "#121317"
@@ -265,7 +265,7 @@ class FrameTile(QAbstractButton):
         self.setCheckable(True)
         self.setCursor(Qt.CursorShape.PointingHandCursor)
         self.setSizePolicy(QSizePolicy.Policy.Expanding, QSizePolicy.Policy.Expanding)
-        self.setMinimumSize(150, 90)
+        self.setMinimumSize(120, 68)
         self.canvas = ImageCanvas(radius=10)
         self.t = 0.0
         self.state = "loading"  # loading | ready | error
@@ -441,8 +441,9 @@ class MainWindow(QMainWindow):
         super().__init__()
         self.setWindowTitle("Minia")
         self.setWindowIcon(QIcon(QPixmap.fromImage(make_icon_image())))
-        self.resize(1240, 780)
-        self.setMinimumSize(900, 600)
+        avail = QApplication.primaryScreen().availableGeometry()
+        self.resize(min(1600, int(avail.width() * 0.92)), min(960, int(avail.height() * 0.9)))
+        self.setMinimumSize(1200, 700)
         self.setAcceptDrops(True)
 
         self.pool = QThreadPool(self)
@@ -470,6 +471,7 @@ class MainWindow(QMainWindow):
 
         self._dots = 0
         self._busy_timer = QTimer(self, interval=400, timeout=self._tick_busy)
+        self._advance_timer = QTimer(self, interval=900, singleShot=True, timeout=self.next_video)
 
         QShortcut(QKeySequence("Ctrl+O"), self, activated=self.browse)
         QShortcut(QKeySequence(Qt.Key.Key_Return), self, activated=self.apply)
@@ -520,13 +522,15 @@ class MainWindow(QMainWindow):
         titles.addWidget(self.file_title)
         titles.addWidget(self.file_meta)
         head.addLayout(titles, 1)
+        self.prev_btn = QPushButton("Revenir à la précédente")
+        self.prev_btn.clicked.connect(self.prev_video)
         self.skip_btn = QPushButton("Passer à la suivante")
         self.skip_btn.clicked.connect(self.next_video)
         self.change_btn = QPushButton("Autre vidéo…")
         self.change_btn.clicked.connect(self.browse)
         self.close_btn = QPushButton("Fermer")
         self.close_btn.clicked.connect(self.close_all)
-        for b in (self.skip_btn, self.change_btn, self.close_btn):
+        for b in (self.prev_btn, self.skip_btn, self.change_btn, self.close_btn):
             head.addWidget(b)
         root.addLayout(head)
 
@@ -630,6 +634,7 @@ class MainWindow(QMainWindow):
             self._update_header()
 
     def load(self, index: int):
+        self._advance_timer.stop()  # navigation manuelle : annule l'avance automatique
         self.pos = index
         self.current = self.queue[index]
         self.duration = 0.0
@@ -652,9 +657,16 @@ class MainWindow(QMainWindow):
         if self.pos + 1 < len(self.queue):
             self.load(self.pos + 1)
 
+    def prev_video(self):
+        if self.busy:
+            return
+        if self.pos > 0:
+            self.load(self.pos - 1)
+
     def close_all(self):
         if self.busy:
             return
+        self._advance_timer.stop()
         self.queue, self.pos, self.current = [], -1, None
         self.load_gen += 1
         self.frame_gen += 1
@@ -677,6 +689,7 @@ class MainWindow(QMainWindow):
         parts.append(str(p.parent))
         self.file_meta.setText("  ·  ".join(parts))
         self.skip_btn.setVisible(self.pos + 1 < len(self.queue))
+        self.prev_btn.setVisible(self.pos > 0)
 
     # ------------------------------------------------------------------ images
 
@@ -760,13 +773,13 @@ class MainWindow(QMainWindow):
                 self.current_view.set_image(self.tiles[self.selected].image())
             self._show_result(True, f"Miniature appliquée à {Path(path).name}")
             if self.pos + 1 < len(self.queue):
-                QTimer.singleShot(900, self.next_video)
+                self._advance_timer.start()
         else:
             self._show_result(False, msg)
 
     def _set_busy(self, on: bool):
         self.busy = on
-        for w in (self.apply_btn, self.more_btn, self.change_btn, self.skip_btn,
+        for w in (self.apply_btn, self.more_btn, self.change_btn, self.prev_btn, self.skip_btn,
                   self.close_btn, self.cache_btn):
             w.setEnabled(not on)
         for t in self.tiles:
