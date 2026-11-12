@@ -796,8 +796,7 @@ class MainWindow(QMainWindow):
 
     def _tick_busy(self):
         self._dots = (self._dots + 1) % 4
-        self.result.setText("Écriture de la miniature" + "." * self._dots +
-                            "\nQuelques secondes pour les gros fichiers.")
+        self.result.setText("Écriture de la miniature" + "." * self._dots)
 
     def _show_result(self, ok: bool, msg: str):
         self.result.setObjectName("ok" if ok else "err")
@@ -901,7 +900,7 @@ def main():
 
     window = MainWindow()
     dark_title_bar(window)
-    window.show()
+    window.showMaximized()
 
     try:
         core.find_tool("ffmpeg")

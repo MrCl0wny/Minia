@@ -4,6 +4,7 @@ miniature (cover art MP4 « covr ») sans réencodage de la vidéo."""
 from __future__ import annotations
 
 import ctypes
+import io
 import json
 import os
 import shutil
@@ -13,7 +14,7 @@ import time
 import uuid
 from pathlib import Path
 
-from mutagen.mp4 import MP4, MP4Cover
+from mutagen.mp4 import MP4, MP4Cover, MP4Tags
 
 SUPPORTED = {".mp4", ".m4v", ".mov"}
 IS_WINDOWS = sys.platform == "win32"
@@ -103,11 +104,11 @@ def read_cover(path: str | Path) -> bytes | None:
 # --------------------------------------------------------------------------- écriture
 
 def write_cover(path: str | Path, jpeg: bytes) -> None:
-    """Remplace la miniature de la vidéo.
+    """Remplace la miniature de la vidéo, sans réencodage.
 
-    Le travail se fait sur une copie temporaire dans le même dossier, vérifiée
-    puis substituée à l'original : en cas de problème, l'original reste intact.
-    Le flux vidéo n'est jamais réencodé, seules les métadonnées changent.
+    Méthode rapide (presque tous les fichiers) : seul l'atome `moov` (l'index,
+    quelques Mo au plus) est réécrit, en fin de fichier ; les données audio/vidéo
+    ne sont ni lues ni déplacées. Sinon, repli sur une copie complète vérifiée.
     """
     src = Path(path)
     if not src.is_file():
@@ -115,6 +116,159 @@ def write_cover(path: str | Path, jpeg: bytes) -> None:
     if not os.access(src, os.W_OK):
         raise MiniaError("Le fichier est en lecture seule.")
 
+    layout = _top_level_atoms(src)
+    if layout is not None:
+        _write_cover_append(src, *layout, jpeg)
+    else:
+        _write_cover_copy(src, jpeg)
+    notify_shell(src)
+
+
+class _MoovOnlyTags(MP4Tags):
+    """Tags mutagen qui ne touchent pas aux tables d'offsets (stco/co64).
+
+    Utilisé sur un `moov` isolé en mémoire : dans le fichier final, le `moov`
+    est placé après les données, dont les positions ne changent donc pas."""
+
+    def _MP4Tags__update_offsets(self, *_args):  # remplace la méthode privée de MP4Tags
+        pass
+
+
+class _MoovOnlyMP4(MP4):
+    MP4Tags = _MoovOnlyTags
+
+
+_ZERO_ATOM = b"\0\0\0\0"
+
+
+def _top_level_atoms(path: Path) -> tuple[list[tuple[bytes, int, int]], int] | None:
+    """Atomes de premier niveau (type, position, taille) et position de fin utile,
+    ou None si la structure ne permet pas la méthode rapide (MP4 fragmenté,
+    données parasites en fin de fichier, plusieurs `moov`…).
+
+    Les restes d'une écriture interrompue (voir `_write_cover_append`) en fin de
+    fichier sont ignorés et seront écrasés."""
+    size = path.stat().st_size
+    atoms = []
+    with open(path, "rb") as f:
+        pos = 0
+        while pos < size:
+            f.seek(pos)
+            head = f.read(16)
+            if len(head) < 8:
+                return None
+            length = int.from_bytes(head[:4], "big")
+            kind = head[4:8]
+            if length == 0 and kind == _ZERO_ATOM:
+                break
+            if length == 1:
+                if len(head) < 16:
+                    return None
+                length = int.from_bytes(head[8:16], "big")
+            if length < 8 or pos + length > size:  # 0 = « jusqu'à la fin », ou fichier tronqué
+                return None
+            atoms.append((kind, pos, length))
+            pos += length
+    # Un second `moov` en dernière position est un nouvel index dont l'écriture a été
+    # interrompue avant le renommage de l'ancien : les lecteurs prennent le premier,
+    # celui-ci est donc ignoré et sera écrasé.
+    while len(atoms) > 1 and atoms[-1][0] == b"moov" and [a[0] for a in atoms].count(b"moov") > 1:
+        pos = atoms.pop()[1]
+    kinds = [a[0] for a in atoms]
+    if kinds.count(b"moov") != 1 or b"moof" in kinds:
+        return None
+    return atoms, pos
+
+
+def _open_for_update(path: Path):
+    last_error = None
+    for _ in range(10):  # l'Explorateur peut verrouiller brièvement le fichier
+        try:
+            return open(path, "r+b")
+        except PermissionError as exc:
+            last_error = exc
+            time.sleep(0.3)
+    raise MiniaError(
+        "Impossible d'ouvrir le fichier en écriture : il est peut-être ouvert dans un autre "
+        f"programme (lecteur vidéo, volet d'aperçu…).\n\n{last_error}"
+    )
+
+
+def _write_cover_append(src: Path, atoms: list[tuple[bytes, int, int]], end: int,
+                        jpeg: bytes) -> None:
+    """Ajoute un nouveau `moov` (avec la cover) en fin de fichier, puis renomme
+    l'ancien en `free` (4 octets). L'ancien index reste dans le fichier comme
+    espace libre (quelques centaines de Ko à quelques Mo).
+
+    Ordre choisi pour qu'une coupure à n'importe quel moment laisse un fichier lisible :
+    1. corps du nouvel index écrit après un en-tête laissé à zéro : tant que l'en-tête
+       est nul, c'est un atome inconnu « jusqu'à la fin » que les lecteurs ignorent ;
+    2. en-tête `moov` écrit : deux `moov`, les lecteurs prennent le premier (l'ancien) ;
+    3. ancien `moov` renommé en `free` : seul le nouveau reste."""
+    _, moov_pos, moov_len = next(a for a in atoms if a[0] == b"moov")
+    duration = probe_duration(src)
+
+    with open(src, "rb") as f:
+        f.seek(moov_pos)
+        buf = io.BytesIO(f.read(moov_len))
+    try:
+        mp4 = _MoovOnlyMP4(buf)
+        if mp4.tags is None:
+            mp4.add_tags()
+        mp4.tags["covr"] = [MP4Cover(jpeg, imageformat=MP4Cover.FORMAT_JPEG)]
+        buf.seek(0)
+        mp4.save(buf)
+    except Exception as exc:  # noqa: BLE001
+        raise MiniaError(f"Impossible de préparer la miniature :\n{exc}") from exc
+    new_moov = buf.getvalue()
+    if new_moov[4:8] != b"moov":
+        raise MiniaError("Structure de la vidéo inattendue. Le fichier n'a pas été modifié.")
+
+    if shutil.disk_usage(src.parent).free < len(new_moov) + 10 * 1024 * 1024:
+        raise MiniaError("Pas assez d'espace disque libre.")
+
+    def sync(f):
+        f.flush()
+        os.fsync(f.fileno())
+
+    with _open_for_update(src) as f:
+        try:
+            f.truncate(end)  # retire un éventuel reste d'écriture interrompue
+            f.seek(end)
+            f.write(bytes(8))
+            f.write(new_moov[8:])
+            sync(f)
+            f.seek(end)
+            f.write(new_moov[:8])
+            sync(f)
+            f.seek(moov_pos + 4)
+            f.write(b"free")
+            sync(f)
+        except BaseException:
+            f.seek(moov_pos + 4)  # remet le fichier exactement dans son état d'origine
+            f.write(b"moov")
+            f.truncate(end)
+            raise
+
+    # Vérification : la cover est bien là et la vidéo est toujours lisible.
+    ok = False
+    try:
+        tags = MP4(str(src)).tags
+        ok = (bool(tags) and bytes(tags.get("covr", [b""])[0]) == jpeg
+              and abs(probe_duration(src) - duration) <= 0.5)
+    except Exception:  # noqa: BLE001
+        ok = False
+    if not ok:
+        with _open_for_update(src) as f:
+            f.seek(moov_pos + 4)
+            f.write(b"moov")
+            f.truncate(end)
+        raise MiniaError("Vérification échouée : la vidéo a été remise dans son état d'origine.")
+
+
+def _write_cover_copy(src: Path, jpeg: bytes) -> None:
+    """Repli pour les structures inhabituelles : copie temporaire dans le même
+    dossier → modification → vérification → ReplaceFileW."""
     size = src.stat().st_size
     if shutil.disk_usage(src.parent).free < size + 50 * 1024 * 1024:
         raise MiniaError("Pas assez d'espace disque libre pour travailler en sécurité "
@@ -145,8 +299,6 @@ def write_cover(path: str | Path, jpeg: bytes) -> None:
             tmp.unlink(missing_ok=True)
         except OSError:
             pass
-
-    notify_shell(src)
 
 
 def _copy(src: Path, dst: Path) -> None:
