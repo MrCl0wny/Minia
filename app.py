@@ -163,7 +163,7 @@ class FrameJob(QRunnable):
 
 
 class ApplyJob(QRunnable):
-    def __init__(self, path: str, jpeg: bytes, signals: JobSignals):
+    def __init__(self, path: str, jpeg: bytes | None, signals: JobSignals):
         super().__init__()
         self.path, self.jpeg, self.signals = path, jpeg, signals
 
@@ -463,6 +463,7 @@ class MainWindow(QMainWindow):
         self.busy = False
         self.round = 0
         self.selected: int | None = None
+        self.removing = False  # l'écriture en cours retire la miniature
 
         self.stack = QStackedWidget()
         self.stack.addWidget(self._build_home())
@@ -587,6 +588,11 @@ class MainWindow(QMainWindow):
         self.current_view = AspectImageView("Aucune miniature intégrée\n(Windows en choisit une)",
                                             radius=10)
         sl.addWidget(self.current_view)
+        self.remove_btn = QPushButton("Retirer la miniature")
+        self.remove_btn.setToolTip("Supprime la miniature intégrée : Windows reprend son choix par défaut")
+        self.remove_btn.setEnabled(False)
+        self.remove_btn.clicked.connect(self.remove_cover)
+        sl.addWidget(self.remove_btn)
         sl.addStretch(1)
         self.cache_btn = QPushButton("La miniature ne change pas dans l'Explorateur ?",
                                      objectName="link")
@@ -646,6 +652,7 @@ class MainWindow(QMainWindow):
             t.reset()
         self.current_view.set_image(None)
         self.current_view.placeholder = "Lecture…"
+        self.remove_btn.setEnabled(False)
         self.result.setText("")
         self._update_header()
         self.stack.setCurrentIndex(1)
@@ -716,6 +723,7 @@ class MainWindow(QMainWindow):
         self.duration = duration
         self.current_view.placeholder = "Aucune miniature intégrée\n(Windows en choisit une)"
         self.current_view.set_image(cover)
+        self.remove_btn.setEnabled(not self.busy and self.current_view.image() is not None)
         self._update_header()
         self.request_frames(True)
 
@@ -763,15 +771,35 @@ class MainWindow(QMainWindow):
         img = self.tiles[self.selected].image()
         if img is None:
             return
+        self.removing = False
         self._set_busy(True)
         self.pool.start(ApplyJob(self.current, image_to_jpeg(img), self.signals))
+
+    def remove_cover(self):
+        if self.busy or not self.current or self.current_view.image() is None:
+            return
+        answer = QMessageBox.question(
+            self, "Retirer la miniature",
+            "La miniature intégrée à cette vidéo va être supprimée : Windows affichera "
+            "de nouveau sa miniature par défaut.\n\nContinuer ?")
+        if answer != QMessageBox.StandardButton.Yes:
+            return
+        self.removing = True
+        self._set_busy(True)
+        self.pool.start(ApplyJob(self.current, None, self.signals))
 
     def _on_applied(self, path: str, ok: bool, msg: str):
         self._set_busy(False)
         if ok:
-            if path == self.current and self.selected is not None:
-                self.current_view.set_image(self.tiles[self.selected].image())
-            self._show_result(True, f"Miniature appliquée à {Path(path).name}")
+            if path == self.current:
+                if self.removing:
+                    self.current_view.set_image(None)
+                elif self.selected is not None:
+                    self.current_view.set_image(self.tiles[self.selected].image())
+            self.remove_btn.setEnabled(self.current_view.image() is not None)
+            name = Path(path).name
+            self._show_result(True, f"Miniature retirée de {name}" if self.removing
+                              else f"Miniature appliquée à {name}")
             if self.pos + 1 < len(self.queue):
                 self._advance_timer.start()
         else:
@@ -779,8 +807,8 @@ class MainWindow(QMainWindow):
 
     def _set_busy(self, on: bool):
         self.busy = on
-        for w in (self.apply_btn, self.more_btn, self.change_btn, self.prev_btn, self.skip_btn,
-                  self.close_btn, self.cache_btn):
+        for w in (self.apply_btn, self.remove_btn, self.more_btn, self.change_btn, self.prev_btn,
+                  self.skip_btn, self.close_btn, self.cache_btn):
             w.setEnabled(not on)
         for t in self.tiles:
             t.setEnabled(not on and t.state == "ready")
@@ -793,10 +821,12 @@ class MainWindow(QMainWindow):
         else:
             self._busy_timer.stop()
             self.apply_btn.setEnabled(self.selected is not None)
+            self.remove_btn.setEnabled(self.current_view.image() is not None)
 
     def _tick_busy(self):
         self._dots = (self._dots + 1) % 4
-        self.result.setText("Écriture de la miniature" + "." * self._dots)
+        action = "Retrait" if self.removing else "Écriture"
+        self.result.setText(f"{action} de la miniature" + "." * self._dots)
 
     def _show_result(self, ok: bool, msg: str):
         self.result.setObjectName("ok" if ok else "err")
